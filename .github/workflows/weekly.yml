@@ -1,0 +1,33 @@
+name: weekly-fundamentals
+# 毎週日曜 06:00 JST（土 21:00 UTC）に業種リストと全銘柄の業績を取り直す。
+on:
+  schedule:
+    - cron: "0 21 * * 6"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: run full scan
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          LINE_TOKEN: ${{ secrets.LINE_TOKEN }}
+          LINE_USER_ID: ${{ secrets.LINE_USER_ID }}
+        run: python scan.py --full
+      - name: commit data
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/*.json
+          git commit -m "weekly fundamentals $(date -u +%Y-%m-%d)" || echo "no change"
+          git push
