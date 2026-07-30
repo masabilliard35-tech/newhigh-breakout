@@ -1,10 +1,16 @@
-"""スクリーニングの実行本体。
+"""スクリーニングの実行本体（全市場・毎日方式）。
 必須条件: 52週高値更新 × 売上+10%(前年同期比) × 営業利益率20%(通期) × ROE10%
 
+毎日の流れ:
+  1. 全銘柄の株価を取得 → 当日52週高値を更新した銘柄を抽出（数十銘柄）
+  2. その当日新高値だけ業績(ROE・売上成長・営業利益率)をライブ取得
+  3. 4条件を満たすものを通知
+株価の一括取得はレート制限を受けにくく、重い業績取得は当日新高値の数十銘柄だけで済む。
+
 使い方:
-  python scan.py --full   … 業種リスト取得＋全銘柄の業績取得（重い・週1想定）
-  python scan.py          … 業績キャッシュを使い株価だけ最新化＋当日新高値を通知（毎日17:30想定）
-出力: data/rows.json（画面用）, data/funda.json, data/margins.json, data/universe.json（キャッシュ）
+  python scan.py            … 上記の毎日処理（GitHub Actions想定）
+  python scan.py --full     … 全銘柄の業績も取り直す（表の網羅性向上・ローカル想定）
+出力: data/rows.json（画面用）, data/funda.json, data/margins.json, data/universe.json
 """
 import argparse
 import json
@@ -22,10 +28,17 @@ HERE = Path(__file__).parent
 DATA = HERE / "data"
 DATA.mkdir(exist_ok=True)
 W52 = 252
+NEAR = 252          # 表に載せる「高値からの経過日」の上限
+FRESH_NEW = 3       # 当日〜数日以内を「新規」とみなし業績をライブ取得
 
 
 def pc(x):
     return None if x is None else round(x * 100)
+
+
+def load_json(name, default):
+    p = DATA / name
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else default
 
 
 def opm_annual(sym):
@@ -44,108 +57,95 @@ def opm_annual(sym):
     return None if r <= 0 else round(float(oi.iloc[0]) / r * 100, 1)
 
 
-def run_full():
-    print("universe取得...")
-    uni = fetch_universe()
-    (DATA / "universe.json").write_text(json.dumps(uni, ensure_ascii=False), encoding="utf-8")
-    syms = sorted(uni)
-    print(f"  {len(syms)} 銘柄")
-
-    print("業績(.info)取得...")
-    funda = {}
-    for i, s in enumerate(syms, 1):
-        d = [None, None]
-        try:
-            info = yf.Ticker(s).info
-            d = [pc(info.get("returnOnEquity")), pc(info.get("revenueGrowth"))]  # [ROE, 売上成長]
-        except Exception:
-            pass
-        funda[s] = d
-        if i % 200 == 0:
-            print(f"  {i}/{len(syms)}")
-        time.sleep(0.03)
-    (DATA / "funda.json").write_text(json.dumps(funda), encoding="utf-8")
-
-    cand = [s for s, v in funda.items()
-            if v[0] is not None and v[0] >= 10 and v[1] is not None and v[1] >= 10]
-    print(f"営業利益率取得（売上+ROE通過 {len(cand)} 銘柄）...")
-    margins = {}
-    for i, s in enumerate(cand, 1):
-        margins[s] = opm_annual(s)
-        if i % 100 == 0:
-            print(f"  {i}/{len(cand)}")
-        time.sleep(0.05)
-    (DATA / "margins.json").write_text(json.dumps(margins), encoding="utf-8")
-    print("full完了")
+def fetch_fundamentals(sym):
+    """[ROE%, 売上成長%, 営業利益率(通期)%] をライブ取得。"""
+    roe = revg = None
+    try:
+        info = yf.Ticker(sym).info
+        roe = pc(info.get("returnOnEquity"))
+        revg = pc(info.get("revenueGrowth"))
+    except Exception:
+        pass
+    return roe, revg, opm_annual(sym)
 
 
-def qualified_symbols():
-    funda = json.loads((DATA / "funda.json").read_text(encoding="utf-8"))
-    margins = json.loads((DATA / "margins.json").read_text(encoding="utf-8"))
-    out = []
-    for s, v in funda.items():
-        if v[0] is None or v[0] < 10 or v[1] is None or v[1] < 10:
-            continue
-        m = margins.get(s)
-        if m is None or m < 20:
-            continue
-        out.append(s)
-    return out, funda, margins
+def passes(roe, revg, opm):
+    return (roe is not None and roe >= 10 and revg is not None and revg >= 10
+            and opm is not None and opm >= 20)
 
 
-def download_prices(syms):
-    """Yahooのレート制限に備え、小分け＋リトライで株価を取得する。"""
+def download_all(syms, period="15mo", chunk=150):
+    """全銘柄の株価をまとめて取得（レート制限に備え小分け＋リトライ）。"""
     frames = {}
-    CH = 40
-    for i in range(0, len(syms), CH):
-        chunk = syms[i:i + CH]
+    for i in range(0, len(syms), chunk):
+        part = syms[i:i + chunk]
         for attempt in range(3):
             try:
-                h = yf.download(chunk, period="2y", progress=False,
-                                group_by="ticker", threads=False, auto_adjust=True)
+                h = yf.download(part, period=period, progress=False,
+                                group_by="ticker", threads=True, auto_adjust=True)
             except Exception:
                 h = None
             got = 0
             if h is not None:
-                for s in chunk:
+                for s in part:
                     try:
                         d = h[s].dropna(subset=["Close", "Volume"])
-                        if len(d):
+                        if len(d) >= W52:
                             frames[s] = d
                             got += 1
                     except Exception:
                         pass
-            if got >= max(1, len(chunk) // 2):
+            if got >= max(1, len(part) // 3):
                 break
             time.sleep(5 * (attempt + 1))
-        time.sleep(1)
+        print(f"\r株価 {min(i + chunk, len(syms))}/{len(syms)}  取得 {len(frames)}", end="")
+    print()
     return frames
 
 
+def run_full():
+    """全銘柄の業績を取り直してキャッシュを厚くする（ローカル想定・任意）。"""
+    print("universe取得...")
+    uni = fetch_universe()
+    (DATA / "universe.json").write_text(json.dumps(uni, ensure_ascii=False), encoding="utf-8")
+    syms = sorted(uni)
+    print(f"  {len(syms)} 銘柄 / 業績取得...")
+    funda = load_json("funda.json", {})
+    margins = load_json("margins.json", {})
+    for i, s in enumerate(syms, 1):
+        roe, revg, opm = fetch_fundamentals(s)
+        funda[s] = [roe, revg]
+        if opm is not None:
+            margins[s] = opm
+        if i % 200 == 0:
+            print(f"  {i}/{len(syms)}")
+            (DATA / "funda.json").write_text(json.dumps(funda), encoding="utf-8")
+            (DATA / "margins.json").write_text(json.dumps(margins), encoding="utf-8")
+        time.sleep(0.03)
+    (DATA / "funda.json").write_text(json.dumps(funda), encoding="utf-8")
+    (DATA / "margins.json").write_text(json.dumps(margins), encoding="utf-8")
+    print("full完了")
+
+
 def run_daily():
-    if not (DATA / "funda.json").exists():
-        print("業績キャッシュが無いので --full を先に実行します")
-        run_full()
-    uni = json.loads((DATA / "universe.json").read_text(encoding="utf-8"))
-    syms, funda, margins = qualified_symbols()
-    print(f"4条件の候補 {len(syms)} 銘柄の株価取得...")
+    uni = load_json("universe.json", None)
+    if uni is None:
+        print("universe.json が無いので取得します")
+        uni = fetch_universe()
+        (DATA / "universe.json").write_text(json.dumps(uni, ensure_ascii=False), encoding="utf-8")
+    syms = sorted(uni)
+    print(f"全 {len(syms)} 銘柄の株価取得...")
+    frames = download_all(syms)
 
-    if not syms:
-        send("【新高値ブレイク】業績条件を満たす候補が0件でした。"
-             "業績データ取得に失敗した可能性があります（Yahooのレート制限など）。")
-        print("候補0のため終了")
-        return
+    funda = load_json("funda.json", {})
+    margins = load_json("margins.json", {})
 
-    frames = download_prices(syms)
-    rows, new_today, latest = [], [], ""
-    for s in syms:
-        d = frames.get(s)
-        if d is None or len(d) < W52 + 1:
-            continue
+    metrics = {}
+    today_high = []
+    for s, d in frames.items():
         close = d["Close"].to_numpy(dtype=float)
         vol = d["Volume"].to_numpy(dtype=float)
-        # 分割未調整等の異常は除外
-        if float(np.max(close[1:] / close[:-1])) > 1.6:
+        if float(np.max(close[1:] / close[:-1])) > 1.6:      # 分割未調整等の異常
             continue
         w = close[-W52:]
         hi = float(w.max())
@@ -153,40 +153,69 @@ def run_daily():
         last = float(close[-1])
         v50 = float(np.mean(vol[-50:]))
         v5 = float(np.max(vol[-5:]))
-        row = {
-            "sym": s, "name": uni.get(s, {}).get("name", s),
-            "sec": uni.get(s, {}).get("sector", ""),
-            "cap": round((uni.get(s, {}).get("cap") or 0) / 1e8),
-            "price": round(last), "unit": round(last * 100),
-            "since": since, "fromHigh": round((last / hi - 1) * 100, 1),
+        metrics[s] = {
+            "since": since, "price": round(last), "unit": round(last * 100),
+            "fromHigh": round((last / hi - 1) * 100, 1),
             "vol": round(v5 / v50, 1) if v50 else None,
             "ma25": round((last / float(np.mean(close[-25:])) - 1) * 100, 1),
             "ma200": round((last / float(np.mean(close[-200:])) - 1) * 100, 1),
-            "revG": funda[s][1], "roe": funda[s][0], "opmA": margins[s],
         }
+        if since <= FRESH_NEW:
+            today_high.append(s)
+
+    print(f"直近{FRESH_NEW}日以内に52週高値: {len(today_high)} 銘柄 → 業績をライブ取得...")
+    for s in today_high:
+        roe, revg, opm = fetch_fundamentals(s)
+        old = funda.get(s, [None, None])
+        # ライブ取得が失敗(None)したらキャッシュ値を残す＝GitHubで制限されても後退しない
+        funda[s] = [roe if roe is not None else old[0],
+                    revg if revg is not None else old[1]]
+        if opm is not None:
+            margins[s] = opm
+        time.sleep(0.05)
+    (DATA / "funda.json").write_text(json.dumps(funda), encoding="utf-8")
+    (DATA / "margins.json").write_text(json.dumps(margins), encoding="utf-8")
+
+    # 表用: 高値圏 かつ 4条件クリア（業績はキャッシュ＋本日取得分）
+    rows, latest = [], ""
+    alerts = []
+    for s, m in metrics.items():
+        f = funda.get(s, [None, None])
+        opm = margins.get(s)
+        if not passes(f[0], f[1], opm):
+            continue
+        if m["since"] > NEAR:
+            continue
+        row = {"sym": s, "name": uni.get(s, {}).get("name", s),
+               "sec": uni.get(s, {}).get("sector", ""),
+               "cap": round((uni.get(s, {}).get("cap") or 0) / 1e8),
+               **m, "revG": f[1], "roe": f[0], "opmA": opm}
         rows.append(row)
+        if m["since"] == 0:
+            alerts.append(row)
+
+    for s, d in frames.items():
         latest = max(latest, str(d.index[-1].date()))
-        if since == 0:
-            new_today.append(row)
-
-    out = {"date": latest, "universe": len(funda), "qualified": len(syms), "rows": rows}
+    out = {"date": latest, "universe": len(syms), "qualified": len(rows), "rows": rows}
     (DATA / "rows.json").write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
-    print(f"rows.json 保存: {len(rows)} 銘柄 / 最新 {latest} / 当日新高値 {len(new_today)}")
+    print(f"rows.json 保存: {len(rows)} 銘柄 / 最新 {latest} / 当日新高値かつ条件クリア {len(alerts)}")
 
-    notify_new_highs(new_today, latest)
+    notify_alerts(alerts, latest)
 
 
-def notify_new_highs(rows, date):
+def notify_alerts(rows, date):
     if not rows:
-        send(f"【新高値ブレイク】{date}\n本日52週高値を更新した該当銘柄はありません。")
+        send(f"【新高値ブレイク】{date}\n"
+             f"本日52週高値を更新し4条件（売上+10%・営業利益率20%・ROE10%）を"
+             f"満たす銘柄はありませんでした。")
         return
     rows = sorted(rows, key=lambda r: -(r["cap"] or 0))
     lines = [f"【新高値ブレイク】{date}",
-             f"本日52週高値を更新（4条件クリア）: {len(rows)}銘柄", ""]
+             f"本日52週高値を更新かつ4条件クリア: {len(rows)}銘柄", ""]
     for r in rows[:25]:
         vol = f"{r['vol']}x" if r["vol"] is not None else "—"
         lines.append(f"{r['sym']} {r['name'][:14]}  {r['price']:,}円  "
-                     f"出来高{vol}  営業益率{r['opmA']}%  ROE{r['roe']}%")
+                     f"出来高{vol}  営業益率{r['opmA']}%  ROE{r['roe']}%  売上+{r['revG']}%")
     if len(rows) > 25:
         lines.append(f"…ほか {len(rows) - 25} 銘柄")
     send("\n".join(lines))
@@ -194,7 +223,7 @@ def notify_new_highs(rows, date):
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--full", action="store_true", help="業種リスト＋全銘柄業績を取り直す")
+    p.add_argument("--full", action="store_true", help="全銘柄の業績も取り直す（ローカル想定）")
     args = p.parse_args()
     if args.full:
         run_full()
