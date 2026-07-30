@@ -1,8 +1,8 @@
-name: weekly-fundamentals
-# 毎週日曜 06:00 JST（土 21:00 UTC）に業種リストと全銘柄の業績を取り直す。
+name: weekly-fundamentals (手動・非推奨)
+# 注意: 全銘柄の業績取得はYahooのレート制限でGitHub上では失敗しやすい。
+# 業績(funda.json / margins.json)は原則ローカルで `python scan.py --full` を実行して
+# コミットする運用にする。このワークフローは緊急時の手動用に残すだけ。
 on:
-  schedule:
-    - cron: "0 21 * * 6"
   workflow_dispatch: {}
 
 permissions:

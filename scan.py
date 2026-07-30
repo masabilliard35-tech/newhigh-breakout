@@ -93,6 +93,35 @@ def qualified_symbols():
     return out, funda, margins
 
 
+def download_prices(syms):
+    """Yahooのレート制限に備え、小分け＋リトライで株価を取得する。"""
+    frames = {}
+    CH = 40
+    for i in range(0, len(syms), CH):
+        chunk = syms[i:i + CH]
+        for attempt in range(3):
+            try:
+                h = yf.download(chunk, period="2y", progress=False,
+                                group_by="ticker", threads=False, auto_adjust=True)
+            except Exception:
+                h = None
+            got = 0
+            if h is not None:
+                for s in chunk:
+                    try:
+                        d = h[s].dropna(subset=["Close", "Volume"])
+                        if len(d):
+                            frames[s] = d
+                            got += 1
+                    except Exception:
+                        pass
+            if got >= max(1, len(chunk) // 2):
+                break
+            time.sleep(5 * (attempt + 1))
+        time.sleep(1)
+    return frames
+
+
 def run_daily():
     if not (DATA / "funda.json").exists():
         print("業績キャッシュが無いので --full を先に実行します")
@@ -101,15 +130,17 @@ def run_daily():
     syms, funda, margins = qualified_symbols()
     print(f"4条件の候補 {len(syms)} 銘柄の株価取得...")
 
-    hist = yf.download(syms, period="2y", progress=False, group_by="ticker",
-                       threads=True, auto_adjust=True)
+    if not syms:
+        send("【新高値ブレイク】業績条件を満たす候補が0件でした。"
+             "業績データ取得に失敗した可能性があります（Yahooのレート制限など）。")
+        print("候補0のため終了")
+        return
+
+    frames = download_prices(syms)
     rows, new_today, latest = [], [], ""
     for s in syms:
-        try:
-            d = hist[s].dropna(subset=["Close", "Volume"])
-        except Exception:
-            continue
-        if len(d) < W52 + 1:
+        d = frames.get(s)
+        if d is None or len(d) < W52 + 1:
             continue
         close = d["Close"].to_numpy(dtype=float)
         vol = d["Volume"].to_numpy(dtype=float)
