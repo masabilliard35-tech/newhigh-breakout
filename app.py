@@ -8,11 +8,54 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 from plotly.subplots import make_subplots
 
 HERE = Path(__file__).parent
 DATA = HERE / "data" / "rows.json"
+
+CROSSHAIR_JS = """
+<script>
+(function(){
+  var gd=document.getElementById('gd');
+  if(!gd) return;
+  function fmtDate(v){var d=new Date(v);return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');}
+  function fmtNum(v){return Math.abs(v)>=100?Math.round(v).toLocaleString():(Math.round(v*100)/100).toString();}
+  function yAxes(fl){var a=[];Object.keys(fl).forEach(function(k){if(/^yaxis(\\d+)?$/.test(k)){a.push(fl[k]);}});return a;}
+  var ov=document.createElement('div');
+  ov.style.cssText='position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;z-index:5;';
+  var vline=document.createElement('div');vline.style.cssText='position:absolute;border-left:1px dotted #aaa;display:none;';
+  var hline=document.createElement('div');hline.style.cssText='position:absolute;border-top:1px dotted #aaa;display:none;';
+  var dlab=document.createElement('div');dlab.style.cssText='position:absolute;background:#444;color:#fff;font:11px sans-serif;padding:1px 5px;border:1px solid #888;display:none;transform:translateX(-50%);white-space:nowrap;';
+  var plab=document.createElement('div');plab.style.cssText='position:absolute;background:#c0392b;color:#fff;font:11px sans-serif;padding:1px 5px;display:none;white-space:nowrap;';
+  ov.appendChild(vline);ov.appendChild(hline);ov.appendChild(dlab);ov.appendChild(plab);
+  gd.style.position='relative';gd.appendChild(ov);
+  function hide(){vline.style.display=hline.style.display=dlab.style.display=plab.style.display='none';}
+  gd.addEventListener('mousemove',function(e){
+    var fl=gd._fullLayout;if(!fl||!fl.xaxis){hide();return;}
+    var rect=gd.getBoundingClientRect();
+    var mx=e.clientX-rect.left,my=e.clientY-rect.top;
+    var xa=fl.xaxis,xl=xa._offset,xr=xa._offset+xa._length;
+    if(mx<xl||mx>xr){hide();return;}
+    var yas=yAxes(fl),top=1e9,bot=-1e9;
+    for(var i=0;i<yas.length;i++){top=Math.min(top,yas[i]._offset);bot=Math.max(bot,yas[i]._offset+yas[i]._length);}
+    if(my<top||my>bot){hide();return;}
+    vline.style.display='block';vline.style.left=mx+'px';vline.style.top=top+'px';vline.style.height=(bot-top)+'px';
+    dlab.style.display='block';dlab.style.left=mx+'px';dlab.style.top=(bot+3)+'px';dlab.textContent=fmtDate(xa.p2d(mx-xa._offset));
+    var cax=null;for(var j=0;j<yas.length;j++){if(my>=yas[j]._offset&&my<=yas[j]._offset+yas[j]._length){cax=yas[j];break;}}
+    if(cax){
+      hline.style.display='block';hline.style.left=xl+'px';hline.style.top=my+'px';hline.style.width=(xr-xl)+'px';
+      var yData=cax.p2d(my-cax._offset),right=cax.side==='right';
+      plab.style.display='block';plab.style.top=my+'px';plab.textContent=fmtNum(yData);
+      if(right){plab.style.left=(xr+1)+'px';plab.style.transform='translateY(-50%)';}
+      else{plab.style.left=(xl-1)+'px';plab.style.transform='translate(-100%,-50%)';}
+    }else{hline.style.display=plab.style.display='none';}
+  });
+  gd.addEventListener('mouseleave',hide);
+})();
+</script>
+"""
 
 st.set_page_config(page_title="新高値ブレイク スクリーナー", layout="wide")
 
@@ -71,10 +114,17 @@ def chart(sym, name, tf):
     fig.add_trace(go.Scatter(x=df.index, y=rsi(c), name="RSI", line=dict(width=1, color="#2e8b57")), 4, 1)
     fig.add_hline(y=70, line=dict(width=0.6, dash="dot", color="#888"), row=4, col=1)
     fig.add_hline(y=30, line=dict(width=0.6, dash="dot", color="#888"), row=4, col=1)
-    fig.update_layout(height=760, template="plotly_dark", xaxis_rangeslider_visible=False,
-                      margin=dict(l=10, r=10, t=30, b=10), showlegend=False,
-                      title=f"{sym}  {name}  ({tf})")
-    st.plotly_chart(fig, use_container_width=True)
+    for tr in fig.data:                       # RSI以外はツールチップを出さない
+        if getattr(tr, "name", "") != "RSI":
+            tr.hoverinfo = "skip"
+    fig.update_layout(height=720, template="plotly_dark", xaxis_rangeslider_visible=False,
+                      margin=dict(l=55, r=10, t=8, b=28), showlegend=False,
+                      hovermode="closest", dragmode="pan")
+    html = fig.to_html(include_plotlyjs="cdn", full_html=True, div_id="gd",
+                       config={"displayModeBar": False, "responsive": True,
+                               "scrollZoom": True})
+    html = html.replace("</body>", CROSSHAIR_JS + "</body>")
+    components.html(html, height=740, scrolling=False)
 
 
 data = load()
