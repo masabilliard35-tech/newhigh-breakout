@@ -83,8 +83,9 @@ def rsi(s, n=14):
 
 
 def chart(sym, name, tf):
-    period = {"日足": "1y", "週足": "3y", "月足": "10y"}[tf]
+    period = {"日足": "5y", "週足": "max", "月足": "max"}[tf]      # 過去分を先読み
     interval = {"日足": "1d", "週足": "1wk", "月足": "1mo"}[tf]
+    show_days = {"日足": 365, "週足": 365 * 3, "月足": 365 * 10}[tf]  # 初期表示範囲
     df = yf.Ticker(sym).history(period=period, interval=interval, auto_adjust=True)
     if df is None or df.empty:
         st.info("チャートデータを取得できませんでした。")
@@ -120,6 +121,15 @@ def chart(sym, name, tf):
     fig.update_layout(height=720, template="plotly_dark", xaxis_rangeslider_visible=False,
                       margin=dict(l=55, r=10, t=8, b=28), showlegend=False,
                       hovermode="closest", dragmode="pan")
+    end = df.index[-1]
+    start = end - pd.Timedelta(days=show_days)
+    vis = df[df.index >= start]
+    if not vis.empty:
+        fig.update_xaxes(range=[start, end + pd.Timedelta(days=3)])
+        lo, hi = float(vis["Low"].min()), float(vis["High"].max())
+        pad = (hi - lo) * 0.05 or hi * 0.05
+        fig.update_yaxes(range=[lo - pad, hi + pad], row=1, col=1)
+        fig.update_yaxes(range=[0, float(vis["Volume"].max()) * 1.1], row=2, col=1)
     html = fig.to_html(include_plotlyjs="cdn", full_html=True, div_id="gd",
                        config={"displayModeBar": False, "responsive": True,
                                "scrollZoom": True})
