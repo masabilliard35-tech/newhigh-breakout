@@ -1,8 +1,8 @@
 name: daily-scan
-# 毎日 17:30 JST（08:30 UTC）に株価を最新化＋当日新高値を通知。平日のみ。
+# 毎日 17:47 JST（08:47 UTC）に株価を最新化＋当日新高値を通知。平日のみ。
 on:
   schedule:
-    - cron: "30 8 * * 1-5"
+    - cron: "47 8 * * 1-5"
   workflow_dispatch: {}      # 手動実行も可
 
 permissions:
